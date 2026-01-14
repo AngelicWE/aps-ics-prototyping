@@ -14,14 +14,13 @@ import java.util.concurrent.ThreadLocalRandom;
  * Writes MANY frames into ONE container file using memory-mapped I/O
  * with <= 2 GiB windows. Each frame uses a single bulk put(...).
  *
- * Stability strategy (per TRIAL, using a fresh file each time):
- *   1) Prefault (READ_ONLY page-touch across the whole container; no dirty pages)
- *   2) Short CPU warm-up to stabilize clocks/JIT
- *   3) Timed BURN-IN (printed, not summarized), then force()+sleep to drain
- *   4) Measured trial (copy/end-to-end/remap), then force()+sleep
- *
- * This isolates trials from each other and prevents steady writeback backlog
- * growth across trials, which was inflating later measurements.
+ * Updated methodology:
+ *   1) Prefault (optional): READ_ONLY page-touch across the whole container (no dirty pages)
+ *   2) Warmup (NEW): mapping-only warmup across all windows (READ_WRITE map/unmap, no writes)
+ *   3) Warmup (NEW, optional): minimal dirty warmup (write 1 page per window; e.g., 4096 bytes)
+ *   4) CPU warmup spin
+ *   5) SINGLE measured burst write per trial (no full-size burn-in write)
+ *   6) force()+optional sleep after the measured burst
  *
  * Usage:
  *   java MemoryMapWriteBurst [width height frameCount [outDir] [bytesPerPixel] [pattern] [trials]]
@@ -30,7 +29,7 @@ import java.util.concurrent.ThreadLocalRandom;
  *     outDir         output directory (default /tmp/aps)
  *     bytesPerPixel  1=8-bit, 2=16-bit, 4=32-bit (default 2)
  *     pattern        { zero | random | ramp | alt } (default random)
- *     trials         number of timed trials (default 1)
+ *     trials         number of timed trials/files to generate (default 1)
  */
 public class MemoryMapWriteBurst {
   // Defaults
@@ -41,13 +40,19 @@ public class MemoryMapWriteBurst {
   static final long WINDOW_BYTES   = 2_000_000_000L;
 
   // Per-trial isolation & pacing (no CLI)
-  private static final boolean ROTATE_PATHS                 = true;   // create a fresh file per trial
-  private static final boolean ENABLE_PREFAULT              = true;   // read-only page-touch
-  private static final int     CPU_WARMUP_MS                = 150;    // small spin to stabilize clocks/JIT
-  private static final boolean FORCE_FLUSH_AFTER_BURNIN     = false;   // drain before measured copy
-  private static final int     SLEEP_AFTER_BURNIN_MS        = 0;    // give writeback time to settle
-  private static final boolean FORCE_FLUSH_AFTER_TRIAL      = false;   // drain after measured copy
-  private static final int     SLEEP_AFTER_TRIAL_MS         = 0;    // brief breather
+  private static final boolean ROTATE_PATHS        = true;  // create a fresh file per trial
+
+  // Optional stabilization
+  private static final boolean ENABLE_PREFAULT     = false;  // read-only page-touch (no dirty pages)
+  private static final boolean ENABLE_MAP_WARMUP   = true;  // NEW: map/unmap each window READ_WRITE (no write)
+  private static final boolean ENABLE_DIRTY_WARMUP = true;  // NEW: dirty only a small amount per window
+  private static final int     DIRTY_WARMUP_BYTES  = 4096;  // NEW: dirty 1 page per window (<= len)
+
+  private static final int     CPU_WARMUP_MS       = 150;   // small spin to stabilize clocks/JIT
+
+  // Post-trial drain (keep visible to diagnose writeback pressure)
+  private static final boolean FORCE_FLUSH_AFTER_TRIAL = false;
+  private static final int     SLEEP_AFTER_TRIAL_MS    = 0;
 
   public static void main(String[] args) throws IOException {
     if (args.length == 1 || args.length == 2 || args.length > 7) {
@@ -82,12 +87,15 @@ public class MemoryMapWriteBurst {
 
     System.out.printf("Burst -> %dx%d @ %d B/px (%s), %d frames, container %,d bytes%n",
         width, height, bpp, pattern, frames, containerBytes);
+    System.out.printf("Warmup: prefault=%s, mapWarmup=%s, dirtyWarmup=%s (%d bytes/window), cpuWarmupMs=%d%n",
+        ENABLE_PREFAULT, ENABLE_MAP_WARMUP, ENABLE_DIRTY_WARMUP, DIRTY_WARMUP_BYTES, CPU_WARMUP_MS);
 
     // Per-trial totals
     List<Double> copyMsList     = new ArrayList<>(trials);
     List<Double> end2endMsList  = new ArrayList<>(trials);
     List<Double> remapMsList    = new ArrayList<>(trials);
     List<Integer> remapsList    = new ArrayList<>(trials);
+    List<Double> forceMsList    = new ArrayList<>(trials);
 
     for (int t = 1; t <= trials; t++) {
       Path path = outDir.resolve(String.format(
@@ -104,30 +112,23 @@ public class MemoryMapWriteBurst {
 
         // -------------------- Prefault (READ_ONLY page-touch) --------------------
         if (ENABLE_PREFAULT) {
-          final int page = 4096;
-          for (long start = 0; start < containerBytes; start += WINDOW_BYTES) {
-            int len = (int) Math.min(WINDOW_BYTES, containerBytes - start);
-            MappedByteBuffer ro = ch.map(FileChannel.MapMode.READ_ONLY, start, len);
-            for (int p = 0; p < len; p += page) {
-              byte b = ro.get(p);
-              if ((b & 1) == 2) System.out.print(""); // keep JIT from eliding
-            }
-          }
+          prefaultReadOnly(ch, containerBytes);
+        }
+
+        // -------------------- Warmup: mapping-only across windows (no writes) --------------------
+        if (ENABLE_MAP_WARMUP) {
+          warmupMappingsOnly(ch, containerBytes);
+        }
+
+        // -------------------- Warmup: minimal dirty write per window --------------------
+        if (ENABLE_DIRTY_WARMUP) {
+          warmupDirtyOnePagePerWindow(ch, containerBytes, DIRTY_WARMUP_BYTES);
         }
 
         // Short CPU warm-up
         cpuWarmupMillis(CPU_WARMUP_MS);
 
-        // -------------------- Timed BURN-IN (printed, not summarized) --------------------
-        TrialResult burn = runOneTimedTrial(ch, src, frameBytes, containerBytes);
-        System.out.printf("Trial %d burn-in: copy=%.3f ms | end-to-end=%.3f ms | remap=%.3f ms | remaps=%d -> %s%n",
-            t, burn.copyMs, burn.endToEndMs, burn.remapMs, burn.remaps, path.toAbsolutePath());
-
-        // Drain before measured trial
-        double burnFlushMs = forceAndTime(ch);
-        if (SLEEP_AFTER_BURNIN_MS > 0) sleepMs(SLEEP_AFTER_BURNIN_MS);
-
-        // -------------------- Measured trial --------------------
+        // -------------------- SINGLE measured burst --------------------
         TrialResult r = runOneTimedTrial(ch, src, frameBytes, containerBytes);
 
         copyMsList.add(r.copyMs);
@@ -135,14 +136,17 @@ public class MemoryMapWriteBurst {
         remapMsList.add(r.remapMs);
         remapsList.add(r.remaps);
 
-        System.out.printf("Trial %d/%d:     copy=%.3f ms | end-to-end=%.3f ms | remap=%.3f ms | remaps=%d | force()=%.3f ms%n",
-            t, trials, r.copyMs, r.endToEndMs, r.remapMs, r.remaps, burnFlushMs);
+        // Drain after measured trial (optional) + always record force() time for diagnostics
+        double forceMs = forceAndTime(ch);
+        forceMsList.add(forceMs);
 
-        // Drain after measured trial
-        double flushMs = forceAndTime(ch);
+        System.out.printf("Trial %d/%d: copy=%.3f ms | end-to-end=%.3f ms | remap=%.3f ms | remaps=%d | force()=%.3f ms -> %s%n",
+            t, trials, r.copyMs, r.endToEndMs, r.remapMs, r.remaps, forceMs, path.toAbsolutePath());
+
+        if (FORCE_FLUSH_AFTER_TRIAL) {
+          // force() already called above; this flag is preserved for legacy toggling semantics
+        }
         if (SLEEP_AFTER_TRIAL_MS > 0) sleepMs(SLEEP_AFTER_TRIAL_MS);
-        // Print flush time so you can see whether writeback is the culprit
-        System.out.printf("Trial %d post-flush: force()=%.3f ms%n", t, flushMs);
       }
     }
 
@@ -150,13 +154,63 @@ public class MemoryMapWriteBurst {
     summarize("copy ms",     copyMsList);
     summarize("end-to-end",  end2endMsList);
     summarize("remap ms",    remapMsList);
+    summarize("force ms",    forceMsList);
+
     int[] remArr = remapsList.stream().mapToInt(Integer::intValue).toArray();
     System.out.println("Remaps (count): min=" + Arrays.stream(remArr).min().orElse(0) +
         " max=" + Arrays.stream(remArr).max().orElse(0) +
         " mean=" + String.format("%.2f", mean(remArr)));
   }
 
-// -------------------- Core timed trial (FIXED windowing logic) --------------------
+  // -------------------- Prefault (READ_ONLY) --------------------
+  private static void prefaultReadOnly(FileChannel ch, long containerBytes) throws IOException {
+    final int page = 4096;
+    for (long start = 0; start < containerBytes; start += WINDOW_BYTES) {
+      int len = (int) Math.min(WINDOW_BYTES, containerBytes - start);
+      MappedByteBuffer ro = ch.map(FileChannel.MapMode.READ_ONLY, start, len);
+      for (int p = 0; p < len; p += page) {
+        byte b = ro.get(p);
+        if ((b & 1) == 2) System.out.print(""); // keep JIT from eliding
+      }
+      if ((len % page) != 0) {
+        byte b = ro.get(len - 1);
+        if ((b & 1) == 2) System.out.print("");
+      }
+    }
+  }
+
+  // -------------------- Warmup: map/unmap windows (READ_WRITE, no writes) --------------------
+  private static void warmupMappingsOnly(FileChannel ch, long containerBytes) throws IOException {
+    for (long start = 0; start < containerBytes; start += WINDOW_BYTES) {
+      int len = (int) Math.min(WINDOW_BYTES, containerBytes - start);
+      MappedByteBuffer map = ch.map(FileChannel.MapMode.READ_WRITE, start, len);
+      // Touch a couple of positions via reads only (still non-dirty) to avoid complete elision.
+      // Reading from READ_WRITE mapping does not dirty pages.
+      byte b0 = map.get(0);
+      byte b1 = map.get(len - 1);
+      if (((b0 ^ b1) & 1) == 2) System.out.print("");
+      // Let map go out of scope; GC/unmap timing is OS-dependent, but warmup still exercises mapping path.
+    }
+  }
+
+  // -------------------- Warmup: dirty only one small page per window --------------------
+  private static void warmupDirtyOnePagePerWindow(FileChannel ch, long containerBytes, int dirtyBytes) throws IOException {
+    if (dirtyBytes <= 0) return;
+
+    byte[] tiny = new byte[Math.min(dirtyBytes, 4096)];
+    // Deterministic, non-zero pattern
+    for (int i = 0; i < tiny.length; i++) tiny[i] = (byte) (i * 31 + 7);
+
+    for (long start = 0; start < containerBytes; start += WINDOW_BYTES) {
+      int len = (int) Math.min(WINDOW_BYTES, containerBytes - start);
+      MappedByteBuffer map = ch.map(FileChannel.MapMode.READ_WRITE, start, len);
+      int n = Math.min(tiny.length, len);
+      map.position(0);
+      map.put(tiny, 0, n); // dirties only first page(s) of each window
+    }
+  }
+
+  // -------------------- Core timed trial (fixed windowing logic) --------------------
   private static TrialResult runOneTimedTrial(FileChannel ch, byte[] src,
                                               int frameBytes, long containerBytes) throws IOException {
     long copyNsTotal  = 0L;
@@ -165,7 +219,7 @@ public class MemoryMapWriteBurst {
 
     int remaps = 0;
     final int totalFrames = (int) (containerBytes / frameBytes);
-    
+
     MappedByteBuffer map = null;
     long currentWindowStart = -1;
     int currentWindowLen = 0;
@@ -173,26 +227,21 @@ public class MemoryMapWriteBurst {
     for (int frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
       long frameOffset = (long) frameIndex * frameBytes;
       long frameEnd = frameOffset + frameBytes;
-      
-      // Check if current frame fits in the current window
-      boolean needsRemap = (map == null) || 
-                          (frameOffset < currentWindowStart) || 
+
+      boolean needsRemap = (map == null) ||
+                          (frameOffset < currentWindowStart) ||
                           (frameEnd > currentWindowStart + currentWindowLen);
-      
+
       if (needsRemap) {
-        // Start new window at this frame's offset
         long windowStart = frameOffset;
-        
-        // Window extends as far as possible (up to WINDOW_BYTES) but must stay within container
         long maxWindowEnd = Math.min(windowStart + WINDOW_BYTES, containerBytes);
         int windowLen = (int) (maxWindowEnd - windowStart);
-        
-        // Create new mapping
+
         long t0 = System.nanoTime();
         map = ch.map(FileChannel.MapMode.READ_WRITE, windowStart, windowLen);
-        map.position(0); 
+        map.position(0);
         long t1 = System.nanoTime();
-        
+
         currentWindowStart = windowStart;
         currentWindowLen = windowLen;
         remaps++;
@@ -257,6 +306,10 @@ public class MemoryMapWriteBurst {
 
   // -------------------- Stats helpers --------------------
   private static void summarize(String label, List<Double> vals) {
+    if (vals.isEmpty()) {
+      System.out.printf("Summary (%s): no data%n", label);
+      return;
+    }
     double[] a = vals.stream().mapToDouble(Double::doubleValue).toArray();
     Arrays.sort(a);
     double mn = a[0], mx = a[a.length - 1];
